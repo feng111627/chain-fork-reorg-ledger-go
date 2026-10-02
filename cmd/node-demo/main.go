@@ -71,4 +71,46 @@ func main() {
 	fmt.Println("== 4. 交易池校验 ==")
 	fmt.Printf("  nonce 缺口: %v\n", n.SubmitTx(ledger.Tx{From: "bob", To: "alice", Amount: 1, Nonce: 9}))
 	fmt.Printf("  余额不足: %v\n", n.SubmitTx(ledger.Tx{From: "bob", To: "alice", Amount: 100000, Nonce: 1}))
+
+	fmt.Println("== 5. 重组撤销的交易自动回流并重新打包 ==")
+	n2 := ledger.NewNode(map[string]uint64{"alice": 100})
+	tx := ledger.Tx{From: "alice", To: "carol", Amount: 10, Nonce: 0}
+	if err := n2.SubmitTx(tx); err != nil {
+		panic(err)
+	}
+	if _, err := n2.ProduceBlock(); err != nil {
+		panic(err)
+	}
+	fmt.Printf("  旧主链确认后池子: %d, carol=%d\n", n2.PoolLen(), n2.Balance("carol"))
+	// 从创世造一条不含该交易、权重更高的分叉触发重组。
+	g2 := n2.MainChain()[0]
+	f1 := child(g2, 1) // 空块
+	f2 := child(f1, 3) // 加大权重反超
+	if err := n2.ImportBlock(f1); err != nil {
+		panic(err)
+	}
+	if err := n2.ImportBlock(f2); err != nil {
+		panic(err)
+	}
+	fmt.Printf("  重组后：carol=%d（旧转账撤销），池子=%d（被撤销交易回流）\n",
+		n2.Balance("carol"), n2.PoolLen())
+	if _, err := n2.ProduceBlock(); err != nil {
+		panic(err)
+	}
+	fmt.Printf("  回流交易重新打包：池子=%d, carol=%d（恰好生效一次）\n",
+		n2.PoolLen(), n2.Balance("carol"))
+
+	fmt.Println("== 6. 池子容量上限：打满拒绝，腾出后恢复 ==")
+	n3 := ledger.NewNodeWithCap(map[string]uint64{"alice": 1_000_000}, 2)
+	for i := uint64(0); i < 3; i++ {
+		err := n3.SubmitTx(ledger.Tx{From: "alice", To: "bob", Amount: 1, Nonce: i})
+		if err != nil {
+			fmt.Printf("  nonce=%d 提交被拒: %v\n", i, err)
+		}
+	}
+	if _, err := n3.ProduceBlock(); err != nil {
+		panic(err)
+	}
+	fmt.Printf("  出块腾出空间后池子: %d，再提交 nonce=2: %v\n",
+		n3.PoolLen(), n3.SubmitTx(ledger.Tx{From: "alice", To: "bob", Amount: 1, Nonce: 2}))
 }
