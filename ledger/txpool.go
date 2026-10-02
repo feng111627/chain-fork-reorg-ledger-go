@@ -1,31 +1,44 @@
 package ledger
 
 import (
+	"fmt"
 	"sort"
 )
 
 // TxPool 是交易池。入池前基于当前主链状态做校验：
 //   - nonce 必须恰好等于「链上 nonce + 池中该账户已排队交易数」，
 //     小了说明已上链或在池中（重复），大了说明有缺口，均明确拒绝；
-//   - 该账户链上余额必须覆盖池中全部待打包交易与本次交易之和。
+//   - 该账户链上余额必须覆盖池中全部待打包交易与本次交易之和；
+//   - 池容量有上限，满后新提交返回 ErrPoolFull（空间腾出后可再提交）。
+//
+// 重组后通过 Reorg 与主链重新对齐：被撤销的交易重新入池，
+// 已失效（已上链 / nonce 缺口 / 余额不足 / 同 nonce 冲突）的交易被清除，
+// 被清除的交易同时移出去重标记，之后重新变合法时可再次提交。
 //
 // TxPool 不做并发控制，并发安全由 Node 保证。
 type TxPool struct {
-	stateFn func() *State         // 返回当前主链状态快照
-	pending map[string][]Tx       // 按账户分组，切片内 nonce 严格连续递增
-	seen    map[[32]byte]struct{} // 交易哈希去重
+	stateFn  func() *State         // 返回当前主链状态快照
+	capacity int                   // 容量上限；<= 0 表示不限
+	pending  map[string][]Tx       // 按账户分组，切片内 nonce 严格连续递增
+	seen     map[[32]byte]struct{} // 交易哈希去重
+	count    int                   // 池中交易总数（避免 Len 每次遍历）
 }
 
 // NewTxPool 创建交易池，stateFn 用于查询当前主链状态。
-func NewTxPool(stateFn func() *State) *TxPool {
+// capacity 为容量上限（仅约束新提交；重组回收的交易不受限，保证不丢交易），
+// capacity <= 0 表示不限容量。
+func NewTxPool(stateFn func() *State, capacity int) *TxPool {
 	return &TxPool{
-		stateFn: stateFn,
-		pending: make(map[string][]Tx),
-		seen:    make(map[[32]byte]struct{}),
+		stateFn:  stateFn,
+		capacity: capacity,
+		pending:  make(map[string][]Tx),
+		seen:     make(map[[32]byte]struct{}),
 	}
 }
 
 // Add 校验并加入一笔交易；失败时返回明确错误，绝不静默丢弃。
+// 池满返回 ErrPoolFull（含容量信息），被拒绝的交易未入池也未标记去重，
+// 空间腾出后重新提交同一笔交易可以成功。
 func (p *TxPool) Add(tx Tx) error {
 	if tx.Amount == 0 {
 		return ErrNegativeAmount
@@ -33,6 +46,9 @@ func (p *TxPool) Add(tx Tx) error {
 	h := tx.Hash()
 	if _, ok := p.seen[h]; ok {
 		return ErrDuplicateTransaction
+	}
+	if p.capacity > 0 && p.count >= p.capacity {
+		return fmt.Errorf("%w: %d/%d", ErrPoolFull, p.count, p.capacity)
 	}
 	st := p.stateFn()
 	base := st.Nonce(tx.From)
@@ -59,6 +75,7 @@ func (p *TxPool) Add(tx Tx) error {
 	}
 	p.pending[tx.From] = append(queued, tx)
 	p.seen[h] = struct{}{}
+	p.count++
 	return nil
 }
 
@@ -91,7 +108,10 @@ func (p *TxPool) Remove(txs []Tx) {
 		} else {
 			p.pending[tx.From] = q
 		}
-		delete(p.seen, tx.Hash())
+		if _, ok := p.seen[tx.Hash()]; ok {
+			delete(p.seen, tx.Hash())
+			p.count--
+		}
 	}
 }
 
@@ -104,7 +124,7 @@ func (p *TxPool) Prune(st *State) {
 			if t.Nonce >= base {
 				keep = append(keep, t)
 			} else {
-				delete(p.seen, t.Hash())
+				p.drop(t)
 			}
 		}
 		if len(keep) == 0 {
@@ -115,11 +135,80 @@ func (p *TxPool) Prune(st *State) {
 	}
 }
 
-// Len 返回池中交易数量。
-func (p *TxPool) Len() int {
-	n := 0
-	for _, q := range p.pending {
-		n += len(q)
+// Reorg 在主链顶端切换（重组或新区块上链）后，把池子与新主链状态重新对齐：
+//  1. 被重组撤销的交易（reverted，旧主链确认过、新主链没有）按账户 + nonce
+//     顺序重新入池；与池中已有交易同 nonce 冲突时，以链上确认过的版本为准，
+//     被顶掉的版本移出池并清除去重标记（之后重新变合法可再提交）；
+//  2. 全量重校验：已在新主链落账的、nonce 出现缺口的、余额不足的交易
+//     全部清除，并同步清除去重标记。
+//
+// 重组回收不占用容量上限，保证已确认过的交易不因池满而丢失。
+func (p *TxPool) Reorg(st *State, reverted []Tx) {
+	// 1. 回收被撤销的交易：按账户归并，同 nonce 冲突时链上版本优先。
+	if len(reverted) > 0 {
+		sorted := make([]Tx, len(reverted))
+		copy(sorted, reverted)
+		sort.Slice(sorted, func(i, j int) bool {
+			if sorted[i].From != sorted[j].From {
+				return sorted[i].From < sorted[j].From
+			}
+			return sorted[i].Nonce < sorted[j].Nonce
+		})
+		for _, tx := range sorted {
+			h := tx.Hash()
+			if _, ok := p.seen[h]; ok {
+				continue // 池中已有同一笔，无需回收
+			}
+			q := p.pending[tx.From]
+			// 同 nonce 冲突：移除池中版本，链上确认过的版本顶替。
+			for i, t := range q {
+				if t.Nonce == tx.Nonce {
+					p.drop(t)
+					q = append(q[:i], q[i+1:]...)
+					break
+				}
+			}
+			// 按 nonce 升序插入。
+			i := sort.Search(len(q), func(i int) bool { return q[i].Nonce > tx.Nonce })
+			q = append(q, Tx{})
+			copy(q[i+1:], q[i:])
+			q[i] = tx
+			p.pending[tx.From] = q
+			p.seen[h] = struct{}{}
+			p.count++
+		}
 	}
-	return n
+	// 2. 全量重校验：每个账户只保留从链上 nonce 起连续且余额可覆盖的前缀。
+	for acc, q := range p.pending {
+		base := st.Nonce(acc)
+		bal := st.Balance(acc)
+		var spent uint64
+		keep := q[:0]
+		for i, t := range q {
+			if t.Nonce != base+uint64(i) || spent+t.Amount > bal {
+				break // 从这笔起（含）全部失效：已确认/缺口/余额不足
+			}
+			spent += t.Amount
+			keep = append(keep, t)
+		}
+		for _, t := range q[len(keep):] {
+			p.drop(t)
+		}
+		if len(keep) == 0 {
+			delete(p.pending, acc)
+		} else {
+			p.pending[acc] = keep
+		}
+	}
 }
+
+// drop 从去重标记中移除一笔交易并更新计数（调用方负责从 pending 中摘除）。
+func (p *TxPool) drop(tx Tx) {
+	if _, ok := p.seen[tx.Hash()]; ok {
+		delete(p.seen, tx.Hash())
+		p.count--
+	}
+}
+
+// Len 返回池中交易数量。
+func (p *TxPool) Len() int { return p.count }

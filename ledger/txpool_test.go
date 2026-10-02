@@ -7,7 +7,7 @@ import (
 
 func newTestPool() *TxPool {
 	st := NewState(map[string]uint64{"alice": 100, "bob": 50})
-	return NewTxPool(func() *State { return st })
+	return NewTxPool(func() *State { return st }, 0)
 }
 
 // TestPoolAddValidation 覆盖入池校验：nonce 缺口、nonce 已确认、
@@ -67,7 +67,7 @@ func TestPoolAddValidation(t *testing.T) {
 // TestPoolRemoveAndPrune 覆盖打包移除与链上确认后的清理。
 func TestPoolRemoveAndPrune(t *testing.T) {
 	st := NewState(map[string]uint64{"alice": 100})
-	p := NewTxPool(func() *State { return st })
+	p := NewTxPool(func() *State { return st }, 0)
 	txs := []Tx{
 		{From: "alice", To: "bob", Amount: 10, Nonce: 0},
 		{From: "alice", To: "bob", Amount: 10, Nonce: 1},

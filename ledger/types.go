@@ -20,6 +20,7 @@ var (
 	ErrNonceGap             = errors.New("transaction nonce gap")
 	ErrDuplicateTransaction = errors.New("transaction already in pool")
 	ErrNegativeAmount       = errors.New("transaction amount must be positive")
+	ErrPoolFull             = errors.New("transaction pool is full")
 )
 
 // Tx 是一笔转账交易。

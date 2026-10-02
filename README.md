@@ -57,15 +57,39 @@ cmd/node-demo/    本地演示程序
 
 - **入池校验**（`TxPool.Add`）：nonce 必须恰好等于「链上 nonce + 池中该账户排队数」。
   nonce 偏小是重复（`ErrDuplicateTransaction` / `ErrInvalidNonce`），
- 偏大是缺口（`ErrNonceGap`），余额校验把池中排队金额一并计入
+  偏大是缺口（`ErrNonceGap`），余额校验把池中排队金额一并计入
   （`ErrInsufficientBalance`）。所有拒绝都返回明确错误，绝不静默丢弃。
+- **容量上限**：池子有容量上限（`NewNode` 默认 `DefaultPoolCapacity`，
+  可用 `NewNodeWithPoolCap` 自定义，<= 0 表示不限）。池满时新提交返回
+  `ErrPoolFull`（错误信息带当前占用/容量），被拒绝的交易不留任何残留标记，
+  空间腾出后重新提交同一笔可以成功。
+- **池随主链走**（`TxPool.Reorg`，由 `Node.ImportBlock` 在同一临界区内自动调用）：
+  主链顶端一切换，池子立即按新主链状态重对齐——
+  - 被重组撤销的交易（旧主链确认过、新主链没有）**自动回池**，按账户 + nonce
+    重新排好，后续出块会重新打包，不丢交易、不重复计账；与池中已有交易同
+    nonce 冲突时以链上确认过的版本为准。回收不占用容量上限（宁可暂时超限
+    也不丢已确认交易），超限期间新提交仍被拒绝；
+  - 已在新主链落账的、nonce 出缺口的、余额不足的、与新主链冲突的交易
+    **立即清除**，并同步清除去重标记——之后同一笔交易重新变合法时再提交
+    能正常入池，不会被「之前提交过」挡在门外。
 - **打包移除**：`Node.ProduceBlock` 把池中交易按确定顺序（账户字典序 + nonce 升序）
-  打包上链并立即从池中移除；`ImportBlock` 也会清除已上链（含重组后新主链确认）的交易。
+  打包上链并立即从池中移除。
 - **并发模型**：`Node` 的所有公开方法共用一把 `sync.RWMutex`。
-  写操作（SubmitTx / ImportBlock / ProduceBlock）互斥且原子——重组在外界看来瞬间完成；
-  读操作（Balance / Nonce / Head / Snapshot）只读到某个完整操作结束后的状态。
+  写操作（SubmitTx / ImportBlock / ProduceBlock）互斥且原子——重组与池子
+  重对齐在同一个临界区内完成，外界永远看不到「链已切换、池还是旧的」的
+  中间状态；读操作（Balance / Nonce / Head / Snapshot / PoolPending）
+  只读到某个完整操作结束后的状态。
   需要同时观察多个账户时请用 `Snapshot()` 获取同一时点的完整状态快照，
   避免逐账户读取跨越写操作。
+
+### 兼容范围
+
+- `Chain` 的导入校验、分叉选择与重组语义完全不变，既有用例无回归。
+- `NewNode` 行为变化仅一点：池子从「不限容量」变为默认 1024 上限；
+  需要旧行为可用 `NewNodeWithPoolCap(alloc, 0)`（不限容量）。
+- `NewTxPool` 签名增加容量参数（`NewTxPool(stateFn, capacity)`）。
+- 新增导出项：`ErrPoolFull`、`DefaultPoolCapacity`、`NewNodeWithPoolCap`、
+  `TxPool.Reorg`、`Node.PoolPending`。
 
 ## 本地验证
 
@@ -87,4 +111,12 @@ go run ./cmd/node-demo
 | 分叉选择 | `TestForkChoiceTieBreak`（权重平局按哈希决胜） |
 | 交易池 | `TestPoolAddValidation`、`TestPoolRemoveAndPrune`、`TestPoolPendingOrder` |
 | 出块与清池 | `TestProduceBlock`、`TestImportBlockPrunesPool` |
-| 并发 | `TestConcurrentSubmitProduceQuery`（8 账户并发提交 + 后台出块 + 并发快照读，`-race` 下验证总量守恒与最终状态=重放结果） |
+| 重组 × 池 | `TestReorgPoolRealign`（被撤销交易自动回池重排并重新打包；失效交易清除、去重标记不残留、重新变合法后可再提交） |
+| 池容量 | `TestPoolCapacity`（打满明确拒绝 `ErrPoolFull`、腾出空间后恢复、重组回收不受容量限制不丢交易） |
+| 并发 | `TestConcurrentSubmitProduceQuery`（并发提交 + 出块 + 快照读）、`TestConcurrentReorgPoolConsistency`（并发提交/重组/出块/查询，`-race` 下验证快照总量守恒、无失效交易出块、最终不丢不重且状态=重放结果） |
+
+新增场景单独验证：
+
+```bash
+go test ./ledger/ -run 'TestReorgPoolRealign|TestPoolCapacity|TestConcurrentReorgPoolConsistency' -race -v
+```
