@@ -72,6 +72,28 @@ cmd/node-demo/    本地演示程序
   - 已在新主链落账的、nonce 出缺口的、余额不足的、与新主链冲突的交易
     **立即清除**，并同步清除去重标记——之后同一笔交易重新变合法时再提交
     能正常入池，不会被「之前提交过」挡在门外。
+
+#### 外部区块「部分确认」只去已上链的交易，不连坐清空后缀
+
+外部区块常常只把某账户队列**靠前的一部分**（哪怕只有一笔）打包上链。
+修复后 `TxPool.Reorg` 对每个账户逐笔重对齐：
+
+- nonce 已被新主链确认的交易（`nonce < 链上 nonce`）**逐笔移除**，
+  只有真正上链的那几笔离开池子；
+- 后面**还没上链、在新主链上 nonce 仍严格连续、且账户余额仍可覆盖**
+  的待打包交易**原样保留**（金额、顺序、内容都不变），后续出块照常打包，
+  不会因为同账户前面的交易确认了就被一起清掉；
+- 若一次确认把整段前缀（甚至队列全部）带上链，则对剩余交易按新链状态
+  重新判断：仍连续且余额够的保留；出现 nonce 缺口或余额不足的，从该笔起
+  （含）清除。被清除的交易会同步移除去重标记，以后重新提交**同一笔**
+  能正常进池，不会因「之前提交过」一直被当成重复拒之门外；
+- 部分确认只影响对应账户，其他账户的队列不受牵连。
+
+> 修复前的缺陷：重校验用「切片下标」而非「已保留笔数」判断连续性，
+> 队列头部已确认的交易没被先跳过，导致下标 0 就误判断裂并整列清空，
+> 把后面合法的待打包交易悄悄吞掉。修复后连续性基于「链上 nonce + 已保留
+> 笔数」计算，并先跳过已确认前缀。
+
 - **打包移除**：`Node.ProduceBlock` 把池中交易按确定顺序（账户字典序 + nonce 升序）
   打包上链并立即从池中移除。
 - **并发模型**：`Node` 的所有公开方法共用一把 `sync.RWMutex`。
@@ -85,7 +107,13 @@ cmd/node-demo/    本地演示程序
 ### 兼容范围
 
 - `Chain` 的导入校验、分叉选择与重组语义完全不变，既有用例无回归。
-- `NewNode` 行为变化仅一点：池子从「不限容量」变为默认 1024 上限；
+- **部分确认修复是纯 bugfix，不改变任何对外签名与正常流程的外部行为**：
+  `NewNode` / `NewNodeWithPoolCap` / `NewTxPool` / `SubmitTx` / `ImportBlock` /
+  `ProduceBlock` 的签名与错误集合保持不变。唯一的行为差异是修复点本身——
+  外部区块只确认队列前缀时，后面合法的未上链交易由「被误删」变为「保留」；
+  这正是期望的正确语义，依赖旧的「误删后需重新提交」行为的调用方不再需要重提。
+- 被清除交易（缺口/余额不足/冲突）同步移除去重标记、可再次提交的语义不变。
+- `NewNode` 行为变化仅一点（历史版本）：池子从「不限容量」变为默认 1024 上限；
   需要旧行为可用 `NewNodeWithPoolCap(alloc, 0)`（不限容量）。
 - `NewTxPool` 签名增加容量参数（`NewTxPool(stateFn, capacity)`）。
 - 新增导出项：`ErrPoolFull`、`DefaultPoolCapacity`、`NewNodeWithPoolCap`、
@@ -113,10 +141,18 @@ go run ./cmd/node-demo
 | 出块与清池 | `TestProduceBlock`、`TestImportBlockPrunesPool` |
 | 重组 × 池 | `TestReorgPoolRealign`（被撤销交易自动回池重排并重新打包；失效交易清除、去重标记不残留、重新变合法后可再提交） |
 | 池容量 | `TestPoolCapacity`（打满明确拒绝 `ErrPoolFull`、腾出空间后恢复、重组回收不受容量限制不丢交易） |
-| 并发 | `TestConcurrentSubmitProduceQuery`（并发提交 + 出块 + 快照读）、`TestConcurrentReorgPoolConsistency`（并发提交/重组/出块/查询，`-race` 下验证快照总量守恒、无失效交易出块、最终不丢不重且状态=重放结果） |
+| 外部区块部分确认 | `TestPartialConfirm`（只确认单笔/多笔前缀时同账户剩余合法交易原样保留并继续打包；整段前缀全部确认；余额不足只清失效后缀、去重标记不残留；nonce 缺口清除后同笔补齐可再提交；部分确认不牵连其他账户） |
+| 并发 | `TestConcurrentSubmitProduceQuery`（并发提交 + 出块 + 快照读）、`TestConcurrentReorgPoolConsistency`（并发提交/重组/出块/查询，`-race` 下验证快照总量守恒、无失效交易出块、最终不丢不重且状态=重放结果）、`TestConcurrentPartialConfirmConsistency`（并发提交/外部部分确认导入/出块/重组/查询，持续校验「每账户池内交易=链上 nonce 起的连续可覆盖后缀」，最终不丢不重且状态=重放结果） |
 
 新增场景单独验证：
 
 ```bash
-go test ./ledger/ -run 'TestReorgPoolRealign|TestPoolCapacity|TestConcurrentReorgPoolConsistency' -race -v
+# 部分确认（单子用例，日志可见每个业务场景与结果）
+go test ./ledger/ -run TestPartialConfirm -v
+
+# 并发部分确认最终一致性（建议加 -race）
+go test ./ledger/ -run TestConcurrentPartialConfirmConsistency -race -v
+
+# 连同既有重组/容量/并发用例一起回归
+go test ./ledger/ -run 'TestPartialConfirm|TestReorgPoolRealign|TestPoolCapacity|TestConcurrentReorgPoolConsistency' -race -v
 ```

@@ -139,8 +139,15 @@ func (p *TxPool) Prune(st *State) {
 //  1. 被重组撤销的交易（reverted，旧主链确认过、新主链没有）按账户 + nonce
 //     顺序重新入池；与池中已有交易同 nonce 冲突时，以链上确认过的版本为准，
 //     被顶掉的版本移出池并清除去重标记（之后重新变合法可再提交）；
-//  2. 全量重校验：已在新主链落账的、nonce 出现缺口的、余额不足的交易
-//     全部清除，并同步清除去重标记。
+//  2. 全量重校验，逐账户处理：
+//     - 已在新主链落账的交易（nonce < 链上 nonce）逐笔移除。外部区块常常只
+//     确认队列靠前的一部分，此时只移除真正上链的那几笔，后面仍未上链、
+//     在新主链上 nonce 连续且余额可覆盖的待打包交易原样保留，绝不连坐清空；
+//     - 从链上 nonce 起只保留 nonce 严格连续、累计余额可覆盖的前缀，一旦出现
+//     nonce 缺口或余额不足，从该笔起（含）的后缀全部清除。
+//
+// 被清除的交易同步移除去重标记，之后重新变合法时可用同一笔再次提交，
+// 不会因为「之前提交过」被永久当成重复交易拒绝。
 //
 // 重组回收不占用容量上限，保证已确认过的交易不因池满而丢失。
 func (p *TxPool) Reorg(st *State, reverted []Tx) {
@@ -178,21 +185,31 @@ func (p *TxPool) Reorg(st *State, reverted []Tx) {
 			p.count++
 		}
 	}
-	// 2. 全量重校验：每个账户只保留从链上 nonce 起连续且余额可覆盖的前缀。
+	// 2. 全量重校验：
+	//    - nonce 已被新主链确认（< 链上 nonce）的交易逐笔移除，
+	//      但外部区块常常只确认队列靠前的一部分；跳过这些已确认前缀后，
+	//      后面仍连续、余额够的未上链交易必须原样保留，不能跟着一起清掉；
+	//    - 从链上 nonce 起，只保留 nonce 严格连续且累计余额可覆盖的前缀，
+	//      一旦出现 nonce 缺口或余额不足，从该笔起（含）全部清除。
 	for acc, q := range p.pending {
 		base := st.Nonce(acc)
 		bal := st.Balance(acc)
+		keep := make([]Tx, 0, len(q))
 		var spent uint64
-		keep := q[:0]
-		for i, t := range q {
-			if t.Nonce != base+uint64(i) || spent+t.Amount > bal {
-				break // 从这笔起（含）全部失效：已确认/缺口/余额不足
+		validPrefix := true
+		for _, t := range q {
+			switch {
+			case t.Nonce < base:
+				// 已上链：仅移除这一笔，不影响后面未上链的合法交易。
+				p.drop(t)
+			case validPrefix && t.Nonce == base+uint64(len(keep)) && spent+t.Amount <= bal:
+				keep = append(keep, t)
+				spent += t.Amount
+			default:
+				// nonce 缺口或余额不足：从这笔起（含）后缀全部失效。
+				validPrefix = false
+				p.drop(t)
 			}
-			spent += t.Amount
-			keep = append(keep, t)
-		}
-		for _, t := range q[len(keep):] {
-			p.drop(t)
 		}
 		if len(keep) == 0 {
 			delete(p.pending, acc)
