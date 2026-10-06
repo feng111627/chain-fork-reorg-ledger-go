@@ -139,8 +139,9 @@ func (p *TxPool) Prune(st *State) {
 //  1. 被重组撤销的交易（reverted，旧主链确认过、新主链没有）按账户 + nonce
 //     顺序重新入池；与池中已有交易同 nonce 冲突时，以链上确认过的版本为准，
 //     被顶掉的版本移出池并清除去重标记（之后重新变合法可再提交）；
-//  2. 全量重校验：已在新主链落账的、nonce 出现缺口的、余额不足的交易
-//     全部清除，并同步清除去重标记。
+//  2. 全量重校验：先逐笔摘掉已被链上确认的前缀（外部区块部分确认时，
+//     只有真正上链的那几笔出池），剩余交易从链上 nonce 起必须连续且
+//     余额可覆盖，出现缺口或余额不足的才清除，并同步清除去重标记。
 //
 // 重组回收不占用容量上限，保证已确认过的交易不因池满而丢失。
 func (p *TxPool) Reorg(st *State, reverted []Tx) {
@@ -182,16 +183,24 @@ func (p *TxPool) Reorg(st *State, reverted []Tx) {
 	for acc, q := range p.pending {
 		base := st.Nonce(acc)
 		bal := st.Balance(acc)
+		// 先摘掉已被链上确认的前缀（nonce < base）：外部区块可能只确认了
+		// 队列前面几笔，这些逐笔清除；剩余交易必须继续参与连续性校验，
+		// 不能因前缀已确认而整队被清。
+		rest := q
+		for len(rest) > 0 && rest[0].Nonce < base {
+			p.drop(rest[0])
+			rest = rest[1:]
+		}
 		var spent uint64
-		keep := q[:0]
-		for i, t := range q {
+		keep := rest[:0]
+		for i, t := range rest {
 			if t.Nonce != base+uint64(i) || spent+t.Amount > bal {
-				break // 从这笔起（含）全部失效：已确认/缺口/余额不足
+				break // 从这笔起（含）全部失效：nonce 缺口 / 余额不足
 			}
 			spent += t.Amount
 			keep = append(keep, t)
 		}
-		for _, t := range q[len(keep):] {
+		for _, t := range rest[len(keep):] {
 			p.drop(t)
 		}
 		if len(keep) == 0 {

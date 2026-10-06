@@ -69,6 +69,11 @@ cmd/node-demo/    本地演示程序
     重新排好，后续出块会重新打包，不丢交易、不重复计账；与池中已有交易同
     nonce 冲突时以链上确认过的版本为准。回收不占用容量上限（宁可暂时超限
     也不丢已确认交易），超限期间新提交仍被拒绝；
+  - **外部区块部分确认只清掉真正上链的那几笔**：外部区块把某账户队列前面
+    几笔（哪怕只确认一笔）打包上链时，只有这些已确认的交易出池；该账户
+    后面还没上链、在新主链上依然连续且余额够的待打包交易**原样保留**，
+    后续出块照常打包。整段前缀（甚至全部）被确认时，剩余交易按新链上状态
+    重新判定：仍连续且余额够的保留，出现 nonce 缺口或余额不足的才清除；
   - 已在新主链落账的、nonce 出缺口的、余额不足的、与新主链冲突的交易
     **立即清除**，并同步清除去重标记——之后同一笔交易重新变合法时再提交
     能正常入池，不会被「之前提交过」挡在门外。
@@ -85,6 +90,10 @@ cmd/node-demo/    本地演示程序
 ### 兼容范围
 
 - `Chain` 的导入校验、分叉选择与重组语义完全不变，既有用例无回归。
+- 本次修复只改变 `TxPool.Reorg` 重校验的边界行为：外部区块**部分确认**
+  某账户队列时，未上链的合法后缀不再被误清（此前会被一起清掉，只能重新
+  提交）。对「整段确认、重组回收、失效清理、容量上限、并发模型」的既有
+  语义无影响，全部既有用例无回归。
 - `NewNode` 行为变化仅一点：池子从「不限容量」变为默认 1024 上限；
   需要旧行为可用 `NewNodeWithPoolCap(alloc, 0)`（不限容量）。
 - `NewTxPool` 签名增加容量参数（`NewTxPool(stateFn, capacity)`）。
@@ -112,11 +121,15 @@ go run ./cmd/node-demo
 | 交易池 | `TestPoolAddValidation`、`TestPoolRemoveAndPrune`、`TestPoolPendingOrder` |
 | 出块与清池 | `TestProduceBlock`、`TestImportBlockPrunesPool` |
 | 重组 × 池 | `TestReorgPoolRealign`（被撤销交易自动回池重排并重新打包；失效交易清除、去重标记不残留、重新变合法后可再提交） |
+| 外部区块部分确认 | `TestExternalBlockPartialConfirm`（只确认部分交易时同账户剩余合法交易不误删、可照常打包）、`TestExternalBlockPrefixConfirmBoundary`（整段/全部确认后的边界：余额不足截断清除、重报同一笔不误判重复） |
 | 池容量 | `TestPoolCapacity`（打满明确拒绝 `ErrPoolFull`、腾出空间后恢复、重组回收不受容量限制不丢交易） |
-| 并发 | `TestConcurrentSubmitProduceQuery`（并发提交 + 出块 + 快照读）、`TestConcurrentReorgPoolConsistency`（并发提交/重组/出块/查询，`-race` 下验证快照总量守恒、无失效交易出块、最终不丢不重且状态=重放结果） |
+| 并发 | `TestConcurrentSubmitProduceQuery`（并发提交 + 出块 + 快照读）、`TestConcurrentReorgPoolConsistency`（并发提交/重组/出块/查询）、`TestConcurrentPartialConfirmConsistency`（并发提交/外部区块部分确认/出块/重组/查询）；均在 `-race` 下验证快照总量守恒、无失效交易出块、最终不丢不重且状态=重放结果 |
 
 新增场景单独验证：
 
 ```bash
 go test ./ledger/ -run 'TestReorgPoolRealign|TestPoolCapacity|TestConcurrentReorgPoolConsistency' -race -v
+
+# 本次修复场景：外部区块部分确认、整段前缀确认边界、并发下最终一致性
+go test ./ledger/ -run 'TestExternalBlock|TestConcurrentPartialConfirmConsistency' -race -v
 ```
